@@ -67,7 +67,10 @@ pub struct RQS {
 
     port_number: Option<u32>,
 
+    /// Progress and state updates published to UI subscribers.
     pub message_sender: broadcast::Sender<ChannelMessage>,
+    /// Control commands sent from the UI to active transfers.
+    pub command_sender: broadcast::Sender<ChannelMessage>,
 }
 
 impl Default for RQS {
@@ -86,6 +89,7 @@ impl RQS {
         *guard = download_path;
 
         let (message_sender, _) = broadcast::channel(50);
+        let (command_sender, _) = broadcast::channel(50);
         let (ble_sender, _) = broadcast::channel(5);
 
         // Define default visibility as per the args inside the new()
@@ -101,6 +105,7 @@ impl RQS {
             ble_sender,
             port_number,
             message_sender,
+            command_sender,
         }
     }
 
@@ -129,6 +134,7 @@ impl RQS {
             endpoint_id[..4].try_into()?,
             tcp_listener,
             self.message_sender.clone(),
+            self.command_sender.clone(),
             send_channel.1,
         )?;
         let ctk = ctoken.clone();

@@ -1,5 +1,7 @@
-use std::fs::File;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -7,16 +9,19 @@ use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use libaes::{Cipher, AES_256_KEY_LEN};
 use p256::ecdh::diffie_hellman;
-use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-use p256::{EncodedPoint, PublicKey};
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use prost::Message;
 use rand::Rng;
 use sha2::{Digest, Sha256, Sha512};
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::{Receiver, Sender};
 
-use super::{InnerState, State};
+use super::frame_reader::{write_frame_with_deferred_commands, FrameReader};
+use super::inbound_files::{
+    choose_destination, cleanup_temp_file, create_temp_file, finalize_temp_file,
+    validate_remote_filename,
+};
+use super::{append_byte_payload_chunk, parse_peer_p256_public_key, InnerState, State};
 use crate::channel::{ChannelAction, ChannelDirection, ChannelMessage};
 use crate::hdl::info::{InternalFileInfo, TransferMetadata};
 use crate::hdl::{TextPayloadInfo, TextPayloadType};
@@ -36,29 +41,57 @@ use crate::securemessage::{
 use crate::sharing_nearby::{paired_key_result_frame, text_metadata};
 use crate::utils::{
     encode_point, gen_ecdsa_keypair, gen_random, get_download_dir, hkdf_extract_expand,
-    stream_read_exact, to_four_digit_string, DeviceType, RemoteDeviceInfo,
+    to_four_digit_string, DeviceType, RemoteDeviceInfo,
 };
 use crate::{location_nearby_connections, sharing_nearby};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const SANE_FRAME_LENGTH: i32 = 5 * 1024 * 1024;
 const SANITY_DURATION: Duration = Duration::from_micros(10);
 
 #[derive(Debug)]
 pub struct InboundRequest {
     socket: TcpStream,
+    frame_reader: FrameReader,
     pub state: InnerState,
+    temp_file_paths: HashMap<i64, PathBuf>,
     sender: Sender<ChannelMessage>,
-    receiver: Receiver<ChannelMessage>,
+    command_receiver: Receiver<ChannelMessage>,
+    pending_commands: VecDeque<ChannelMessage>,
+}
+
+impl Drop for InboundRequest {
+    fn drop(&mut self) {
+        // Close handles before removing temporary paths. This also keeps
+        // cancellation cleanup working on platforms that do not allow an open
+        // file to be unlinked.
+        for file in self.state.transferred_files.values_mut() {
+            file.file.take();
+        }
+
+        for (_, path) in self.temp_file_paths.drain() {
+            if let Err(error) = cleanup_temp_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        "Failed to clean up temporary received file {:?}: {}",
+                        path, error
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl InboundRequest {
-    pub fn new(socket: TcpStream, id: String, sender: Sender<ChannelMessage>) -> Self {
-        let receiver = sender.subscribe();
-
+    pub fn new(
+        socket: TcpStream,
+        id: String,
+        sender: Sender<ChannelMessage>,
+        command_sender: Sender<ChannelMessage>,
+    ) -> Self {
         Self {
             socket,
+            frame_reader: FrameReader::default(),
             state: InnerState {
                 id,
                 server_seq: 0,
@@ -67,87 +100,86 @@ impl InboundRequest {
                 encryption_done: true,
                 ..Default::default()
             },
+            temp_file_paths: HashMap::new(),
             sender,
-            receiver,
+            command_receiver: command_sender.subscribe(),
+            pending_commands: VecDeque::new(),
         }
     }
 
     pub async fn handle(&mut self) -> Result<(), anyhow::Error> {
-        // Buffer for the 4-byte length
-        let mut length_buf = [0u8; 4];
+        if let Some(command) = self.pending_commands.pop_front() {
+            self.handle_command(command).await?;
+            return Ok(());
+        }
 
         tokio::select! {
-            i = self.receiver.recv() => {
+            i = self.command_receiver.recv() => {
                 match i {
                     Ok(channel_msg) => {
-                        if channel_msg.direction == ChannelDirection::LibToFront {
-                            return Ok(());
-                        }
-
-                        if channel_msg.id != self.state.id {
-                            return Ok(());
-                        }
-
-                        debug!("inbound: got: {:?}", channel_msg);
-                        match channel_msg.action {
-                            Some(ChannelAction::AcceptTransfer) => {
-                                self.accept_transfer().await?;
-                            },
-                            Some(ChannelAction::RejectTransfer) => {
-                                self.update_state(
-                                    |e| {
-                                        e.state = State::Rejected;
-                                    },
-                                    true,
-                                ).await;
-
-                                self.reject_transfer(Some(
-                                    sharing_nearby::connection_response_frame::Status::Reject
-                                )).await?;
-                                return Err(anyhow!(crate::errors::AppError::NotAnError));
-                            },
-                            Some(ChannelAction::CancelTransfer) => {
-                                self.update_state(
-                                    |e| {
-                                        e.state = State::Cancelled;
-                                    },
-                                    true,
-                                ).await;
-                                self.disconnection().await?;
-                                return Err(anyhow!(crate::errors::AppError::NotAnError));
-                            },
-                            None => {
-                                trace!("inbound: nothing to do")
-                            },
-                        }
+                        self.handle_command(channel_msg).await?;
                     }
-                    Err(e) => {
-                        error!("inbound: channel error: {}", e);
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        return Err(anyhow!("Control channel lagged by {count} messages"));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(anyhow!(crate::errors::AppError::NotAnError));
                     }
                 }
             },
-            h = stream_read_exact(&mut self.socket, &mut length_buf) => {
-                h?;
-
-                self._handle(length_buf).await?
+            h = self.frame_reader.read_frame(&mut self.socket) => {
+                self._handle(h?).await?
             }
         }
 
         Ok(())
     }
 
-    pub async fn _handle(&mut self, length_buf: [u8; 4]) -> Result<(), anyhow::Error> {
-        let msg_length = u32::from_be_bytes(length_buf) as usize;
-        // Ensure the message length is not unreasonably big to avoid allocation attacks
-        if msg_length > SANE_FRAME_LENGTH as usize {
-            error!("Message length too big");
-            return Err(anyhow!("value"));
+    async fn handle_command(&mut self, channel_msg: ChannelMessage) -> Result<(), anyhow::Error> {
+        if channel_msg.direction == ChannelDirection::LibToFront || channel_msg.id != self.state.id
+        {
+            return Ok(());
         }
 
-        // Allocate buffer for the actual message and read it
-        let mut frame_data = vec![0u8; msg_length];
-        stream_read_exact(&mut self.socket, &mut frame_data).await?;
+        debug!("inbound: got: {:?}", channel_msg);
+        match channel_msg.action {
+            Some(ChannelAction::AcceptTransfer) => {
+                self.accept_transfer().await?;
+            }
+            Some(ChannelAction::RejectTransfer) => {
+                self.update_state(
+                    |e| {
+                        e.state = State::Rejected;
+                    },
+                    true,
+                )
+                .await;
 
+                self.reject_transfer(Some(
+                    sharing_nearby::connection_response_frame::Status::Reject,
+                ))
+                .await?;
+                return Err(anyhow!(crate::errors::AppError::NotAnError));
+            }
+            Some(ChannelAction::CancelTransfer) => {
+                self.update_state(
+                    |e| {
+                        e.state = State::Cancelled;
+                    },
+                    true,
+                )
+                .await;
+                return Err(anyhow!(crate::errors::AppError::NotAnError));
+            }
+            None => {
+                trace!("inbound: nothing to do")
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn _handle(&mut self, frame_data: Vec<u8>) -> Result<(), anyhow::Error> {
         let current_state = &self.state;
         // Now determine what will be the request type based on current state
         match current_state.state {
@@ -526,46 +558,43 @@ impl InboundRequest {
                         info!("Processing PayloadType::Bytes");
                         let payload_id = header.id();
 
-                        if header.total_size() > SANE_FRAME_LENGTH.into() {
-                            self.state.payload_buffers.remove(&payload_id);
-                            return Err(anyhow!(
-                                "Payload too large: {} bytes",
-                                header.total_size()
-                            ));
-                        }
-
-                        self.state
-                            .payload_buffers
-                            .entry(payload_id)
-                            .or_insert_with(|| Vec::with_capacity(header.total_size() as usize));
-
-                        // Get the current length of the buffer, if it exists, without holding a mutable borrow.
-                        let buffer_len = self.state.payload_buffers.get(&payload_id).unwrap().len();
-                        if chunk.offset() != buffer_len as i64 {
-                            self.state.payload_buffers.remove(&payload_id);
-                            return Err(anyhow!(
-                                "Unexpected chunk offset: {}, expected: {}",
-                                chunk.offset(),
-                                buffer_len
-                            ));
-                        }
-
-                        let buffer = self.state.payload_buffers.get_mut(&payload_id).unwrap();
-                        if let Some(body) = &chunk.body {
-                            buffer.extend(body);
-                        }
+                        let body = chunk.body.as_deref().unwrap_or_default();
+                        append_byte_payload_chunk(
+                            &mut self.state.payload_buffers,
+                            payload_id,
+                            header.total_size(),
+                            chunk.offset(),
+                            body,
+                        )?;
 
                         if (chunk.flags() & 1) == 1 {
                             debug!("Chunk flags & 1 == 1 ?? End of data ??");
+
+                            let buffer = self
+                                .state
+                                .payload_buffers
+                                .remove(&payload_id)
+                                .ok_or_else(|| anyhow!("Payload buffer was not created"))?;
+                            if !buffer.is_complete() {
+                                return Err(anyhow!(
+                                    "Payload ended before declared size: {} vs {}",
+                                    buffer.data_len(),
+                                    buffer.declared_size()
+                                ));
+                            }
+                            let payload_bytes = buffer.into_data();
 
                             if self.state.text_payload.is_some()
                                 && self.state.text_payload.as_ref().unwrap().get_i64_value()
                                     == payload_id
                             {
                                 info!("Transfer finished");
-                                let end_index =
-                                    buffer.iter().position(|&b| b == 16).unwrap_or(buffer.len());
-                                let payload = std::str::from_utf8(&buffer[..end_index])?.to_owned();
+                                let end_index = payload_bytes
+                                    .iter()
+                                    .position(|&b| b == 16)
+                                    .unwrap_or(payload_bytes.len());
+                                let payload =
+                                    std::str::from_utf8(&payload_bytes[..end_index])?.to_owned();
 
                                 match self.state.text_payload.clone().unwrap() {
                                     TextPayloadInfo::Url(_) => {
@@ -618,7 +647,7 @@ impl InboundRequest {
                                 return Err(anyhow!(crate::errors::AppError::NotAnError));
                             } else {
                                 let innner_frame =
-                                    sharing_nearby::Frame::decode(buffer.as_slice())?;
+                                    sharing_nearby::Frame::decode(payload_bytes.as_slice())?;
                                 self.process_transfer_setup(&innner_frame).await?;
                             }
                         }
@@ -626,39 +655,88 @@ impl InboundRequest {
                     payload_header::PayloadType::File => {
                         info!("Processing PayloadType::File");
                         let payload_id = header.id();
+                        let body = chunk.body();
+                        let chunk_size = i64::try_from(body.len())
+                            .map_err(|_| anyhow!("File chunk is too large"))?;
+                        let is_last = (chunk.flags() & 1) == 1;
+                        let mut temp_path = if is_last {
+                            Some(self.temp_file_paths.get(&payload_id).cloned().ok_or_else(
+                                || {
+                                    anyhow!(
+                                        "Temporary file for payload ID ({payload_id}) is not known"
+                                    )
+                                },
+                            )?)
+                        } else {
+                            None
+                        };
+                        let mut completed_file = None;
 
-                        let file_internal = self
-                            .state
-                            .transferred_files
-                            .get_mut(&payload_id)
-                            .ok_or_else(|| {
+                        {
+                            let file_internal = self
+                                .state
+                                .transferred_files
+                                .get_mut(&payload_id)
+                                .ok_or_else(|| {
                                 anyhow!("File payload ID ({}) is not known", payload_id)
                             })?;
 
-                        let current_offset = file_internal.bytes_transferred;
-                        if chunk.offset() != current_offset {
-                            return Err(anyhow!(
-                                "Invalid offset into file {}, expected {}",
-                                chunk.offset(),
-                                current_offset
-                            ));
+                            let current_offset = file_internal.bytes_transferred;
+                            if current_offset < 0 || file_internal.total_size < 0 {
+                                return Err(anyhow!("Invalid file transfer size"));
+                            }
+                            if chunk.offset() != current_offset {
+                                return Err(anyhow!(
+                                    "Invalid offset into file {}, expected {}",
+                                    chunk.offset(),
+                                    current_offset
+                                ));
+                            }
+
+                            let next_offset = current_offset
+                                .checked_add(chunk_size)
+                                .ok_or_else(|| anyhow!("File transfer size overflow"))?;
+                            if next_offset > file_internal.total_size {
+                                return Err(anyhow!(
+                                    "Transferred file size exceeds previously specified value: {} vs {}",
+                                    next_offset,
+                                    file_internal.total_size
+                                ));
+                            }
+
+                            if !body.is_empty() {
+                                file_internal
+                                    .file
+                                    .as_ref()
+                                    .ok_or_else(|| anyhow!("File receive was not accepted"))?
+                                    .write_all_at(body, current_offset as u64)?;
+                                file_internal.bytes_transferred = next_offset;
+                            }
+
+                            if is_last {
+                                if file_internal.bytes_transferred != file_internal.total_size {
+                                    return Err(anyhow!(
+                                        "File payload ended at {} bytes, expected {}",
+                                        file_internal.bytes_transferred,
+                                        file_internal.total_size
+                                    ));
+                                }
+
+                                let file = file_internal
+                                    .file
+                                    .take()
+                                    .ok_or_else(|| anyhow!("File receive was not accepted"))?;
+                                completed_file = Some((
+                                    temp_path
+                                        .take()
+                                        .expect("temporary path was checked for final chunk"),
+                                    file_internal.file_url.clone(),
+                                    file,
+                                ));
+                            }
                         }
 
-                        let chunk_size = chunk.body().len();
-                        if current_offset + chunk_size as i64 > file_internal.total_size {
-                            return Err(anyhow!(
-                                "Transferred file size exceeds previously specified value: {} vs {}", current_offset + chunk_size as i64, file_internal.total_size
-                            ));
-                        }
-
-                        if !chunk.body().is_empty() {
-                            file_internal
-                                .file
-                                .as_ref()
-                                .unwrap()
-                                .write_all_at(chunk.body(), current_offset as u64)?;
-                            file_internal.bytes_transferred += chunk_size as i64;
-
+                        if !body.is_empty() {
                             self.update_state(
                                 |e| {
                                     if let Some(tmd) = e.transfer_metadata.as_mut() {
@@ -668,8 +746,21 @@ impl InboundRequest {
                                 true,
                             )
                             .await;
-                        } else if (chunk.flags() & 1) == 1 {
+                        }
+
+                        if let Some((temp_path, final_path, file)) = completed_file {
+                            file.sync_all()?;
+                            drop(file);
+                            let finalized_path = finalize_temp_file(&temp_path, &final_path)?;
+                            if finalized_path != final_path {
+                                info!(
+                                    "Destination appeared during transfer; received file saved as {:?}",
+                                    finalized_path
+                                );
+                            }
+                            self.temp_file_paths.remove(&payload_id);
                             self.state.transferred_files.remove(&payload_id);
+
                             if self.state.transferred_files.is_empty() {
                                 info!("Transfer finished");
                                 self.update_state(
@@ -823,47 +914,62 @@ impl InboundRequest {
         if !introduction.file_metadata.is_empty() && introduction.text_metadata.is_empty() {
             trace!("process_introduction: handling file_metadata");
             let mut files_name = Vec::with_capacity(introduction.file_metadata.len());
+            let mut pending_files = Vec::with_capacity(introduction.file_metadata.len());
+            let mut seen_payload_ids = HashSet::with_capacity(introduction.file_metadata.len());
+            let mut reserved_destinations =
+                HashSet::with_capacity(introduction.file_metadata.len());
+            let download_dir = get_download_dir();
             let mut total_bytes: u64 = 0;
 
             for file in &introduction.file_metadata {
-                info!("File name: {}", file.name());
+                let name = file.name();
+                validate_remote_filename(name)?;
 
-                let mut dest = get_download_dir();
-                dest.push(file.name());
-
-                info!("Destination: {:?}", dest);
-                if dest.exists() {
-                    let mut counter = 1;
-                    dest.pop();
-
-                    loop {
-                        dest.push(format!("{}_{}", counter, file.name()));
-                        if !dest.exists() {
-                            break;
-                        }
-                        dest.pop();
-                        counter += 1;
-                    }
-
-                    info!("New destination: {:?}", dest);
+                let payload_id = file
+                    .payload_id
+                    .ok_or_else(|| anyhow!("Missing file payload ID"))?;
+                if !seen_payload_ids.insert(payload_id)
+                    || self.state.transferred_files.contains_key(&payload_id)
+                {
+                    return Err(anyhow!("Duplicate file payload ID: {payload_id}"));
                 }
 
-                let info = InternalFileInfo {
-                    payload_id: file.payload_id(),
+                let total_size = file
+                    .size
+                    .ok_or_else(|| anyhow!("Missing size for file {name:?}"))?;
+                if total_size < 0 {
+                    return Err(anyhow!(
+                        "Invalid negative size for file {name:?}: {total_size}"
+                    ));
+                }
+
+                let dest = choose_destination(&download_dir, name, &mut reserved_destinations)?;
+                info!(
+                    "Received file metadata for {:?}, destination: {:?}",
+                    name, dest
+                );
+
+                total_bytes = total_bytes
+                    .checked_add(total_size as u64)
+                    .ok_or_else(|| anyhow!("Total transfer size exceeds supported limits"))?;
+                pending_files.push(InternalFileInfo {
+                    payload_id,
                     file_url: dest,
                     bytes_transferred: 0,
-                    total_size: file.size(),
+                    total_size,
                     file: None,
-                };
-                total_bytes += info.total_size as u64;
-                self.state.transferred_files.insert(file.payload_id(), info);
-                files_name.push(file.name().to_owned());
+                });
+                files_name.push(name.to_owned());
+            }
+
+            for file in pending_files {
+                self.state.transferred_files.insert(file.payload_id, file);
             }
 
             let metadata = TransferMetadata {
                 id: self.state.id.clone(),
                 destination: Some(
-                    get_download_dir()
+                    download_dir
                         .into_os_string()
                         .into_string()
                         .map_err(|_| anyhow!("failed to convert PathBuf to String"))?,
@@ -1000,13 +1106,33 @@ impl InboundRequest {
 
     async fn accept_transfer(&mut self) -> Result<(), anyhow::Error> {
         let ids: Vec<i64> = self.state.transferred_files.keys().cloned().collect();
+        let download_dir = get_download_dir();
+        fs::create_dir_all(&download_dir)?;
 
         for id in ids {
-            let mfi = self.state.transferred_files.get_mut(&id).unwrap();
+            let mfi = self
+                .state
+                .transferred_files
+                .get(&id)
+                .ok_or_else(|| anyhow!("File payload ID ({id}) is not known"))?;
+            if mfi.total_size < 0 {
+                return Err(anyhow!("Invalid negative size for file payload ID {id}"));
+            }
+            if mfi.file.is_some() {
+                // A repeated accept action must never truncate an in-progress
+                // receive. The first action owns the temporary file.
+                continue;
+            }
 
-            let file = File::create(&mfi.file_url)?;
-            info!("Created file: {:?}", &file);
+            let (temp_path, file) = create_temp_file(&download_dir, id)?;
+            let mfi = self
+                .state
+                .transferred_files
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("File payload ID ({id}) is not known"))?;
             mfi.file = Some(file);
+            self.temp_file_paths.insert(id, temp_path.clone());
+            info!("Created temporary receive file: {:?}", temp_path);
         }
 
         let frame = sharing_nearby::Frame {
@@ -1063,25 +1189,7 @@ impl InboundRequest {
         &mut self,
         raw_peer_key: GenericPublicKey,
     ) -> Result<(), anyhow::Error> {
-        let peer_p256_key = raw_peer_key
-            .ec_p256_public_key
-            .ok_or_else(|| anyhow!("Missing required fields"))?;
-
-        let mut bytes = vec![0x04];
-        // Ensure no more than 32 bytes for the keys
-        if peer_p256_key.x.len() > 32 {
-            bytes.extend_from_slice(&peer_p256_key.x[peer_p256_key.x.len() - 32..]);
-        } else {
-            bytes.extend_from_slice(&peer_p256_key.x);
-        }
-        if peer_p256_key.y.len() > 32 {
-            bytes.extend_from_slice(&peer_p256_key.y[peer_p256_key.y.len() - 32..]);
-        } else {
-            bytes.extend_from_slice(&peer_p256_key.y);
-        }
-
-        let encoded_point = EncodedPoint::from_bytes(bytes)?;
-        let peer_key = PublicKey::from_encoded_point(&encoded_point).unwrap();
+        let peer_key = parse_peer_p256_public_key(raw_peer_key)?;
         let priv_key = self.state.private_key.as_ref().unwrap();
 
         let dhs = diffie_hellman(priv_key.to_nonzero_scalar(), peer_key.as_affine());
@@ -1291,8 +1399,19 @@ impl InboundRequest {
         prefixed_length.extend_from_slice(&length_bytes);
         prefixed_length.extend_from_slice(&data);
 
-        self.socket.write_all(&prefixed_length).await?;
-        self.socket.flush().await?;
+        if write_frame_with_deferred_commands(
+            &mut self.socket,
+            &prefixed_length,
+            &mut self.command_receiver,
+            &self.state.id,
+            &mut self.pending_commands,
+        )
+        .await?
+        {
+            self.update_state(|state| state.state = State::Cancelled, true)
+                .await;
+            return Err(anyhow!(crate::errors::AppError::NotAnError));
+        }
 
         Ok(())
     }

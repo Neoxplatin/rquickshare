@@ -34,6 +34,7 @@ mod store;
 
 pub struct AppState {
     pub message_sender: broadcast::Sender<ChannelMessage>,
+    pub command_sender: broadcast::Sender<ChannelMessage>,
     pub dch_sender: broadcast::Sender<EndpointInfo>,
     pub visibility_sender: Arc<Mutex<watch::Sender<Visibility>>>,
     pub sender_file: mpsc::Sender<SendInfo>,
@@ -133,6 +134,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     // Define state for tauri app
                     app_handle.manage(AppState {
                         message_sender: rqs.message_sender.clone(),
+                        command_sender: rqs.command_sender.clone(),
                         dch_sender: broadcast::channel(10).0,
                         visibility_sender: rqs.visibility_sender.clone(),
                         sender_file,

@@ -10,19 +10,18 @@ use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use libaes::{Cipher, AES_256_KEY_LEN};
 use p256::ecdh::diffie_hellman;
-use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-use p256::{EncodedPoint, PublicKey};
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use prost::Message;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::{Receiver, Sender};
 use ts_rs::TS;
 
+use super::frame_reader::{write_frame, FrameReader};
 use super::info::{InternalFileInfo, TransferMetadata};
-use super::{InnerState, State};
+use super::{append_byte_payload_chunk, parse_peer_p256_public_key, InnerState, State};
 use crate::channel::{ChannelAction, ChannelDirection, ChannelMessage};
 use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium;
 use crate::location_nearby_connections::connection_response_frame::ResponseStatus;
@@ -44,14 +43,13 @@ use crate::sharing_nearby::{
     file_metadata, paired_key_result_frame, FileMetadata, IntroductionFrame,
 };
 use crate::utils::{
-    encode_point, gen_ecdsa_keypair, gen_random, hkdf_extract_expand, stream_read_exact,
-    to_four_digit_string, DeviceType, RemoteDeviceInfo,
+    encode_point, gen_ecdsa_keypair, gen_random, hkdf_extract_expand, to_four_digit_string,
+    DeviceType, RemoteDeviceInfo,
 };
 use crate::{location_nearby_connections, sharing_nearby};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const SANE_FRAME_LENGTH: i32 = 5 * 1024 * 1024;
 const SANITY_DURATION: Duration = Duration::from_micros(10);
 
 #[derive(Debug, Deserialize, Serialize, TS)]
@@ -64,9 +62,10 @@ pub enum OutboundPayload {
 pub struct OutboundRequest {
     endpoint_id: [u8; 4],
     socket: TcpStream,
+    frame_reader: FrameReader,
     pub state: InnerState,
     sender: Sender<ChannelMessage>,
-    receiver: Receiver<ChannelMessage>,
+    command_receiver: Receiver<ChannelMessage>,
     payload: OutboundPayload,
 }
 
@@ -76,15 +75,17 @@ impl OutboundRequest {
         socket: TcpStream,
         id: String,
         sender: Sender<ChannelMessage>,
+        command_sender: Sender<ChannelMessage>,
         payload: OutboundPayload,
         rdi: RemoteDeviceInfo,
     ) -> Self {
-        let receiver = sender.subscribe();
+        let command_receiver = command_sender.subscribe();
         let OutboundPayload::Files(files) = &payload;
 
         Self {
             endpoint_id,
             socket,
+            frame_reader: FrameReader::default(),
             state: InnerState {
                 id,
                 server_seq: 0,
@@ -100,17 +101,14 @@ impl OutboundRequest {
                 ..Default::default()
             },
             sender,
-            receiver,
+            command_receiver,
             payload,
         }
     }
 
     pub async fn handle(&mut self) -> Result<(), anyhow::Error> {
-        // Buffer for the 4-byte length
-        let mut length_buf = [0u8; 4];
-
         tokio::select! {
-            i = self.receiver.recv() => {
+            i = self.command_receiver.recv() => {
                 match i {
                     Ok(channel_msg) => {
                         if channel_msg.direction == ChannelDirection::LibToFront {
@@ -130,7 +128,6 @@ impl OutboundRequest {
                                     },
                                     true,
                                 ).await;
-                                self.disconnection().await?;
                                 return Err(anyhow!(crate::errors::AppError::NotAnError));
                             },
                             None => {
@@ -139,33 +136,23 @@ impl OutboundRequest {
                             _ => {}
                         }
                     }
-                    Err(e) => {
-                        error!("inbound: channel error: {}", e);
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        return Err(anyhow!("Control channel lagged by {count} messages"));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(anyhow!(crate::errors::AppError::NotAnError));
                     }
                 }
             },
-            h = stream_read_exact(&mut self.socket, &mut length_buf) => {
-                h?;
-
-                self._handle(length_buf).await?
+            h = self.frame_reader.read_frame(&mut self.socket) => {
+                self._handle(h?).await?
             }
         }
 
         Ok(())
     }
 
-    pub async fn _handle(&mut self, length_buf: [u8; 4]) -> Result<(), anyhow::Error> {
-        let msg_length = u32::from_be_bytes(length_buf) as usize;
-        // Ensure the message length is not unreasonably big to avoid allocation attacks
-        if msg_length > SANE_FRAME_LENGTH as usize {
-            error!("Message length too big");
-            return Err(anyhow!("value"));
-        }
-
-        // Allocate buffer for the actual message and read it
-        let mut frame_data = vec![0u8; msg_length];
-        stream_read_exact(&mut self.socket, &mut frame_data).await?;
-
+    pub async fn _handle(&mut self, frame_data: Vec<u8>) -> Result<(), anyhow::Error> {
         let current_state = &self.state;
         // Now determine what will be the request type based on current state
         match current_state.state {
@@ -475,39 +462,33 @@ impl OutboundRequest {
                         info!("Processing PayloadType::Bytes");
                         let payload_id = header.id();
 
-                        if header.total_size() > SANE_FRAME_LENGTH.into() {
-                            self.state.payload_buffers.remove(&payload_id);
-                            return Err(anyhow!(
-                                "Payload too large: {} bytes",
-                                header.total_size()
-                            ));
-                        }
-
-                        self.state
-                            .payload_buffers
-                            .entry(payload_id)
-                            .or_insert_with(|| Vec::with_capacity(header.total_size() as usize));
-
-                        // Get the current length of the buffer, if it exists, without holding a mutable borrow.
-                        let buffer_len = self.state.payload_buffers.get(&payload_id).unwrap().len();
-                        if chunk.offset() != buffer_len as i64 {
-                            self.state.payload_buffers.remove(&payload_id);
-                            return Err(anyhow!(
-                                "Unexpected chunk offset: {}, expected: {}",
-                                chunk.offset(),
-                                buffer_len
-                            ));
-                        }
-
-                        let buffer = self.state.payload_buffers.get_mut(&payload_id).unwrap();
-                        if let Some(body) = &chunk.body {
-                            buffer.extend(body);
-                        }
+                        let body = chunk.body.as_deref().unwrap_or_default();
+                        append_byte_payload_chunk(
+                            &mut self.state.payload_buffers,
+                            payload_id,
+                            header.total_size(),
+                            chunk.offset(),
+                            body,
+                        )?;
 
                         if (chunk.flags() & 1) == 1 {
                             debug!("Chunk flags & 1 == 1 ?? End of data ??");
 
-                            let innner_frame = sharing_nearby::Frame::decode(buffer.as_slice())?;
+                            let buffer = self
+                                .state
+                                .payload_buffers
+                                .remove(&payload_id)
+                                .ok_or_else(|| anyhow!("Payload buffer was not created"))?;
+                            if !buffer.is_complete() {
+                                return Err(anyhow!(
+                                    "Payload ended before declared size: {} vs {}",
+                                    buffer.data_len(),
+                                    buffer.declared_size()
+                                ));
+                            }
+                            let payload_bytes = buffer.into_data();
+                            let innner_frame =
+                                sharing_nearby::Frame::decode(payload_bytes.as_slice())?;
                             self.process_transfer_setup(&innner_frame).await?;
                         }
                     }
@@ -967,25 +948,7 @@ impl OutboundRequest {
         &mut self,
         raw_peer_key: GenericPublicKey,
     ) -> Result<(), anyhow::Error> {
-        let peer_p256_key = raw_peer_key
-            .ec_p256_public_key
-            .ok_or_else(|| anyhow!("Missing required fields"))?;
-
-        let mut bytes = vec![0x04];
-        // Ensure no more than 32 bytes for the keys
-        if peer_p256_key.x.len() > 32 {
-            bytes.extend_from_slice(&peer_p256_key.x[peer_p256_key.x.len() - 32..]);
-        } else {
-            bytes.extend_from_slice(&peer_p256_key.x);
-        }
-        if peer_p256_key.y.len() > 32 {
-            bytes.extend_from_slice(&peer_p256_key.y[peer_p256_key.y.len() - 32..]);
-        } else {
-            bytes.extend_from_slice(&peer_p256_key.y);
-        }
-
-        let encoded_point = EncodedPoint::from_bytes(bytes)?;
-        let peer_key = PublicKey::from_encoded_point(&encoded_point).unwrap();
+        let peer_key = parse_peer_p256_public_key(raw_peer_key)?;
         let priv_key = self.state.private_key.as_ref().unwrap();
 
         let dhs = diffie_hellman(priv_key.to_nonzero_scalar(), peer_key.as_affine());
@@ -1199,8 +1162,18 @@ impl OutboundRequest {
         prefixed_length.extend_from_slice(&length_bytes);
         prefixed_length.extend_from_slice(&data);
 
-        self.socket.write_all(&prefixed_length).await?;
-        self.socket.flush().await?;
+        if write_frame(
+            &mut self.socket,
+            &prefixed_length,
+            &mut self.command_receiver,
+            &self.state.id,
+        )
+        .await?
+        {
+            self.update_state(|state| state.state = State::Cancelled, true)
+                .await;
+            return Err(anyhow!(crate::errors::AppError::NotAnError));
+        }
 
         Ok(())
     }

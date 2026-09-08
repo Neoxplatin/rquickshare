@@ -16,8 +16,12 @@ pub use ble::*;
 mod blea;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
 pub use blea::*;
+mod frame_reader;
 mod inbound;
+mod payload_validation;
 pub use inbound::*;
+pub(crate) use payload_validation::{append_byte_payload_chunk, parse_peer_p256_public_key};
+mod inbound_files;
 pub(crate) mod info;
 mod mdns_discovery;
 pub use mdns_discovery::*;
@@ -82,7 +86,7 @@ pub struct InnerState {
     // pub text_payload_id: i64,
     // pub text_is_url: bool,
     // pub wifi_ssid: Option<String>,
-    pub payload_buffers: HashMap<i64, Vec<u8>>,
+    pub payload_buffers: HashMap<i64, payload_validation::BytePayloadBuffer>,
 }
 
 #[derive(Debug, Clone)]
